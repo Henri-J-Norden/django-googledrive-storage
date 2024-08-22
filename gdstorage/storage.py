@@ -11,7 +11,11 @@ from django.core.files.storage import Storage
 from django.utils.deconstruct import deconstructible
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
+
+
+ID_PREFIX = "__GDRIVE__"
 
 
 class GoogleDrivePermissionType(enum.Enum):
@@ -146,7 +150,7 @@ class GoogleDriveStorage(Storage):
     KEY_FILE_PATH = 'GOOGLE_DRIVE_STORAGE_JSON_KEY_FILE'
     KEY_FILE_CONTENT = 'GOOGLE_DRIVE_STORAGE_JSON_KEY_FILE_CONTENTS'
 
-    def __init__(self, json_keyfile_path=None, permissions=None):
+    def __init__(self, json_keyfile_path=None, permissions=None, parent_id=None, save_folder_id=False):
         """
         Handles credentials and builds the google service.
 
@@ -186,6 +190,11 @@ class GoogleDriveStorage(Storage):
                 # Ok, permissions are good
                 self._permissions = permissions
 
+        if parent_id is not None and save_folder_id is False:
+            raise ValueError('save_folder_id must be True if parent_id is not None')
+        self._parent_id = parent_id
+        self._save_folder_id = save_folder_id
+
         self._drive_service = build('drive', 'v3', credentials=credentials)
 
     def _split_path(self, p):
@@ -212,6 +221,9 @@ class GoogleDriveStorage(Storage):
         :type parent_id: string
         :returns: dict
         """
+        if parent_id is None:
+            parent_id = self._parent_id
+
         folder_data = self._check_file_exists(path, parent_id)
         if folder_data is not None:
             return folder_data
@@ -251,6 +263,9 @@ class GoogleDriveStorage(Storage):
         :type parent_id: string
         :returns: dict containing file / folder data if exists or None if does not exists
         """  # noqa: E501
+        if parent_id is None:
+            parent_id = self._parent_id
+
         if len(filename) == 0:
             # This is the lack of directory at the beginning of a 'file.txt'
             # Since the target file lacks directories, the assumption
@@ -263,6 +278,10 @@ class GoogleDriveStorage(Storage):
             # If so call the method recursively with next portion of path
             # Otherwise the path does not exists hence
             # the file does not exists
+            if split_filename[0].startswith(ID_PREFIX):
+                return self._check_file_exists(
+                    os.path.sep.join(split_filename[1:]), split_filename[0].removeprefix(ID_PREFIX))
+
             q = "mimeType = '{0}' and name = '{1}'".format(
                 self._GOOGLE_DRIVE_FOLDER_MIMETYPE_, split_filename[0],
             )
@@ -277,6 +296,13 @@ class GoogleDriveStorage(Storage):
                     return self._check_file_exists(
                         os.path.sep.join(split_filename[1:]), item['id'])
             return None
+        elif filename.startswith("__ID__"):
+            try:
+                return self._drive_service.files().get(fileId=filename.removeprefix(ID_PREFIX), fields='*').execute()
+            except HttpError as e:
+                if e.resp.status == 404:
+                    return None
+                raise e
         # This is a file, checking if exists
         q = "name = '{0}'".format(split_filename[0])
         if parent_id is not None:
@@ -302,10 +328,13 @@ class GoogleDriveStorage(Storage):
         """For more details see
         https://developers.google.com/drive/api/v3/manage-downloads?hl=id#download_a_file_stored_on_google_drive
         """  # noqa: E501
+        fh = BytesIO()
         file_data = self._check_file_exists(name)
+        if file_data is None:
+            raise FileNotFoundError(name)
+
         request = self._drive_service.files().get_media(
             fileId=file_data['id'])
-        fh = BytesIO()
         downloader = MediaIoBaseDownload(fh, request)
         done = False
         while done is False:
@@ -317,7 +346,7 @@ class GoogleDriveStorage(Storage):
         name = os.path.join(settings.GOOGLE_DRIVE_STORAGE_MEDIA_ROOT, name)
         folder_path = os.path.sep.join(self._split_path(name)[:-1])
         folder_data = self._get_or_create_folder(folder_path)
-        parent_id = None if folder_data is None else folder_data['id']
+        parent_id = self._parent_id if folder_data is None else folder_data['id']
         # Now we had created (or obtained) folder on GDrive
         # Upload the file
         mime_type, _ = mimetypes.guess_type(name)
@@ -341,7 +370,11 @@ class GoogleDriveStorage(Storage):
             self._drive_service.permissions().create(
                 fileId=file_data['id'], body={**p.raw}).execute()
 
-        return file_data.get('originalFilename', file_data.get('name'))
+        if not self._save_folder_id or parent_id is None:
+            parent_path = ""
+        else:
+            parent_path = ID_PREFIX + parent_id + "/"
+        return parent_path + file_data.get('originalFilename', file_data.get('name'))
 
     def delete(self, name):
         """
